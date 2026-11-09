@@ -548,6 +548,13 @@ struct TypingHabitsApp: App {
             Button("导出数据…") { store.exportAll() }
             Button("清空数据,重新来过") { store.resetAll() }
             Button("退出(保存数据)") { store.save(); NSApp.terminate(nil) }
-        } label: { Text((store.running ? "● " : "○ ") + "\(store.stats.total) 🎙\(durStr(store.stats.v.seconds))") }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: store.running ? "record.circle" : "keyboard")
+                Text("\(store.stats.total)")
+                Image(systemName: "waveform")
+                Text(durStr(store.stats.v.seconds))
+            }
+        }
     }
 }
