@@ -53,6 +53,7 @@ let specialNames: [Int64: String] = [51: "⌫", 117: "⌦", 36: "↩", 76: "⌤"
 
 // MARK: - 采集 + 存储
 final class Store: ObservableObject {
+    static let shared = Store()
     @Published var stats = SessionStats()
     @Published var hasPermission = false
     @Published var running = false
@@ -530,24 +531,38 @@ struct ContentView: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ n: Notification) { Store.shared.start() }
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+    func applicationWillTerminate(_ n: Notification) { Store.shared.save() }
+}
+
+struct MenuContent: View {
+    @ObservedObject var store: Store
+    @Environment(\.openWindow) var openWindow
+    var body: some View {
+        Text("\(store.stats.total) 键 · 语音 \(durStr(store.stats.v.seconds)) · 退格率 " + String(format: "%.1f%%", store.backspaceRate * 100) + " · " + (store.running ? "记录中 \(store.elapsedStr)" : "未在记录"))
+        Divider()
+        Button("打开主窗口") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+        if store.running { Button("结束记录") { store.stop() } } else { Button(store.began ? "继续记录" : "开始记录") { store.begin() } }
+        Button("导出数据…") { store.exportAll() }
+        Button("清空数据,重新来过") { store.resetAll() }
+        Divider()
+        Button("退出(保存数据)") { store.save(); NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
 }
 
 @main
 struct TypingHabitsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    @StateObject var store = Store()
+    @StateObject var store = Store.shared
     var body: some Scene {
         Window("打字习惯", id: "main") {
-            ContentView(store: store).onAppear { store.start() }
+            ContentView(store: store)
+                .onAppear { NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true) }
+                .onDisappear { NSApp.setActivationPolicy(.accessory) }
         }
         MenuBarExtra {
-            Text("\(store.stats.total) 键 · 语音 \(durStr(store.stats.v.seconds)) · 退格率 " + String(format: "%.1f%%", store.backspaceRate * 100) + " · " + (store.running ? "记录中 \(store.elapsedStr)" : "未在记录"))
-            Divider()
-            if store.running { Button("结束记录") { store.stop() } } else { Button(store.began ? "继续记录" : "开始记录") { store.begin() } }
-            Button("导出数据…") { store.exportAll() }
-            Button("清空数据,重新来过") { store.resetAll() }
-            Button("退出(保存数据)") { store.save(); NSApp.terminate(nil) }
+            MenuContent(store: store)
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: store.running ? "record.circle" : "keyboard")
