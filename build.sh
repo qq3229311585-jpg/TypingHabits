@@ -20,5 +20,13 @@ cat > $APP/Contents/Info.plist <<PL
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PL
-codesign --force -s - $APP
+KC="$HOME/Library/Keychains/typinghabits-dev.keychain-db"
+if security find-identity "$KC" 2>/dev/null | grep -q "TypingHabits Local Dev"; then
+  security unlock-keychain -p "" "$KC"
+  codesign --force --keychain "$KC" -s "TypingHabits Local Dev" $APP
+  echo "已用固定签名(重装不需要重新授权)"
+else
+  codesign --force -s - $APP
+  echo "临时签名:先运行 ./setup_signing.sh 可避免每次重装都要重新授权"
+fi
 echo built $APP

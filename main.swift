@@ -51,6 +51,36 @@ let charCats = ["字母", "数字", "标点符号", "空格"]
 let specialNames: [Int64: String] = [51: "⌫", 117: "⌦", 36: "↩", 76: "⌤", 49: "␣", 48: "⇥", 53: "⎋",
     123: "←", 124: "→", 125: "↓", 126: "↑", 57: "⇪"]
 
+// MARK: - 输入内容还原(中文输入法显示为拼音)
+struct TextSeg: Identifiable { let id = UUID(); var start: Date; var app: String; var text: String; var isVoice: Bool }
+final class TextBuilder {
+    var segments: [TextSeg] = []
+    private var lastT = 0.0, lastApp = "", open = false
+    private let special = "⌫⌦↩⌤␣⇥⎋←→↓↑⇪"
+    func feed(t: Double, app: String, key: String, mods: String) {
+        if mods.contains("⌘") || mods.contains("⌃") { return }
+        let back = key == "⌫", ret = key == "↩" || key == "⌤", space = key == "␣"
+        let printable = key.count == 1 && !special.contains(key)
+        guard back || ret || space || printable else { return }
+        if !open || app != lastApp || t - lastT > 10 {
+            segments.append(TextSeg(start: Date(timeIntervalSince1970: t), app: app, text: "", isVoice: false)); open = true
+        }
+        lastApp = app; lastT = t
+        let i = segments.count - 1
+        if back { if !segments[i].text.isEmpty { segments[i].text.removeLast() } }
+        else if space { segments[i].text += " " }
+        else if ret { segments[i].text += "⏎"; open = false }
+        else { segments[i].text += mods.contains("⇧") ? key : key.lowercased() }
+    }
+    func addVoice(start: Date, dur: Double, app: String) {
+        segments.append(TextSeg(start: start, app: app, text: "〔语音 \(Int(dur.rounded())) 秒〕", isVoice: true)); open = false
+    }
+    var transcript: String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        return segments.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }.map { "[\(f.string(from: $0.start))] [\($0.app)] \($0.text)" }.joined(separator: "\n") + "\n"
+    }
+}
+
 // MARK: - 采集 + 存储
 final class Store: ObservableObject {
     static let shared = Store()
@@ -61,6 +91,8 @@ final class Store: ObservableObject {
     var accum = 0.0
     var runStart: Date?
     var started = false
+    var builder = TextBuilder()
+    var segments: [TextSeg] { builder.segments }
     @Published var recentCPM = 0
     var sessionStart = Date()
     var elapsed: Double { accum + (runStart.map { Date().timeIntervalSince($0) } ?? 0) }
@@ -99,6 +131,14 @@ final class Store: ObservableObject {
         if let d = try? Data(contentsOf: metaURL), let s = try? JSONDecoder().decode(Saved.self, from: d) {
             sessionStart = s.start; stats = s.stats
             accum = s.accum ?? 0; began = s.began ?? (s.stats.total > 0)
+        }
+        if let txt = try? String(contentsOf: rawURL, encoding: .utf8) {
+            for line in txt.split(separator: "\n") {
+                guard let o = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+                let t = (o["t"] as? Double ?? 0) / 1000, app = o["app"] as? String ?? ""
+                if o["type"] as? String == "key" { builder.feed(t: t, app: app, key: o["key"] as? String ?? "", mods: o["mods"] as? String ?? "") }
+                else if o["type"] as? String == "voice" { builder.addVoice(start: Date(timeIntervalSince1970: t), dur: o["dur"] as? Double ?? 0, app: app) }
+            }
         }
         hasPermission = CGPreflightListenEventAccess()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -159,7 +199,7 @@ final class Store: ObservableObject {
         tap = t
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, t, 0), .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
-        hasPermission = true
+        hasPermission = CGPreflightListenEventAccess()
     }
 
     func handleFlags(_ e: CGEvent) {
@@ -197,6 +237,7 @@ final class Store: ObservableObject {
         v.count += 1; v.seconds += dur; v.longest = max(v.longest, dur)
         v.hourlySec[h] += dur; v.appSec[app, default: 0] += dur
         v.sessions.append(VoiceSession(start: start, dur: dur, app: app))
+        builder.addVoice(start: start, dur: dur, app: app)
         stats.v = v; dirty = true
         log(["t": Int(start.timeIntervalSince1970 * 1000), "type": "voice", "dur": dur, "app": app])
         objectWillChange.send()
@@ -248,6 +289,7 @@ final class Store: ObservableObject {
         let c = Calendar.current.dateComponents([.hour, .minute], from: now)
         let h = c.hour ?? 0, m = h * 60 + (c.minute ?? 0)
 
+        builder.feed(t: now.timeIntervalSince1970, app: app, key: label, mods: mods)
         log(["t": Int(now.timeIntervalSince1970 * 1000), "type": "key", "app": app, "key": label, "mods": mods, "code": code])
 
         stats.total += 1
@@ -297,7 +339,12 @@ final class Store: ObservableObject {
         recent.removeAll { $0 < Date().addingTimeInterval(-60) }
         recentCPM = recent.count
         if running && elapsed >= Store.maxSeconds { stop() }
-        if running && !hasPermission { installTap() }
+        if running {
+            let perm = CGPreflightListenEventAccess()
+            if perm && !hasPermission, let t = tap { CGEvent.tapEnable(tap: t, enable: false); CFMachPortInvalidate(t); tap = nil }
+            hasPermission = perm
+            if tap == nil { installTap() }
+        }
         objectWillChange.send()
     }
 
@@ -314,7 +361,7 @@ final class Store: ObservableObject {
         stop()
         try? FileManager.default.removeItem(at: rawURL)
         try? FileManager.default.removeItem(at: metaURL)
-        stats = SessionStats(); began = false; accum = 0; runStart = nil; running = false; sessionStart = Date()
+        builder = TextBuilder(); stats = SessionStats(); began = false; accum = 0; runStart = nil; running = false; sessionStart = Date()
         lastKeyTime = nil; wordBuf = ""; fnDownAt = nil; voiceActive = nil; lastTap = nil; dirty = true; save()
     }
 
@@ -373,6 +420,7 @@ final class Store: ObservableObject {
             }
         }
         w("原始日志.csv", rows)
+        try? builder.transcript.write(to: out.appendingPathComponent("输入内容.txt"), atomically: true, encoding: .utf8)
         if let d = try? JSONEncoder().encode(Saved(start: sessionStart, stats: stats, finished: false, accum: elapsed, began: began)) { try? d.write(to: out.appendingPathComponent("完整统计.json")) }
         NSWorkspace.shared.activateFileViewerSelecting([out])
     }
@@ -407,6 +455,7 @@ struct Card: View {
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
     }
 }
+func tms(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: d) }
 func hm(_ m: Int) -> String { String(format: "%02d:%02d", m / 60, m % 60) }
 func tm(_ d: Date?) -> String { d.map { let c = Calendar.current.dateComponents([.hour, .minute], from: $0); return hm((c.hour ?? 0) * 60 + (c.minute ?? 0)) } ?? "-" }
 
@@ -450,7 +499,7 @@ struct ContentView: View {
                     }
                 }
                 if store.running && !store.hasPermission {
-                    Text("需要授权:系统设置 → 隐私与安全性 → 输入监控,勾选 TypingHabits,然后重启本 App。").font(.callout)
+                    Text("键盘监听没有权限(鼠标能记、按键记不到就是这个原因)。系统设置 → 隐私与安全性 → 输入监控:先选中 TypingHabits 点「−」删掉,再点「+」重新添加 /Applications/TypingHabits.app 并打开开关,然后退出重开本 App。").font(.callout)
                         .padding(10).background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
                 }
                 Text("数据只存在本机 ~/Library/Application Support/TypingHabits/,累计记录满 24 小时会自动停止。点「开始/结束」随时控制。密码框等系统安全输入不会被记录。").font(.caption).foregroundStyle(.secondary)
@@ -474,6 +523,25 @@ struct ContentView: View {
                         Chart(0..<24, id: \.self) { h in BarMark(x: .value("时", h), y: .value("分钟", s.v.hourlySec[h] / 60)).foregroundStyle(.pink) }
                             .chartXScale(domain: -0.5...23.5).chartXAxis { AxisMarks(values: .stride(by: 3)) }.frame(height: 110)
                         Text("说话的文字内容系统听写直接插入输入框,不经过键盘事件,本 App 抓不到,这里只记时长。").font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+
+                GroupBox("输入内容(按时间;中文输入显示为拼音,拼音后的数字是选第几个词)") {
+                    let segs = Array(store.segments.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }.suffix(150).reversed())
+                    if segs.isEmpty { Text("暂无,开始记录后这里会按时间显示你打过的内容").foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 60) }
+                    else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 8) {
+                                ForEach(segs) { seg in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Text(tms(seg.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                        Text(seg.app).font(.caption2).padding(.horizontal, 6).padding(.vertical, 1).background(.quaternary, in: Capsule())
+                                        Text(seg.text).textSelection(.enabled).foregroundStyle(seg.isVoice ? Color.pink : Color.primary)
+                                        Spacer(minLength: 0)
+                                    }
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }.frame(height: 240)
                     }
                 }
 
